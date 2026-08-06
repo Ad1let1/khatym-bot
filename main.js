@@ -516,6 +516,116 @@ function scheduleTasks() {
 }
 
 
+const VALID_REACTIONS = ['👍', '👍🏻', '👍🏼', '👍🏽', '👍🏾', '👍🏿', '❤', '❤️', '✅', '➕'];
+
+async function handleReaction(senderId, targetMsgId, emoji) {
+    try {
+        console.log(`🔔 Реакция: sender=${senderId}, target=${targetMsgId}, emoji=${emoji || '(removed)'}`);
+
+        if (targetMsgId === db.regMsgId_1) {
+            if (emoji && VALID_REACTIONS.includes(emoji)) {
+                if (getAlmatyDateStr() === START_DATE) {
+                    if (!db.users_1.includes(senderId)) {
+                        db.users_1.push(senderId);
+                        console.log(`Тіркелді (1-пара): ${senderId}`);
+                    }
+                }
+            } else if (!emoji && getAlmatyDateStr() === START_DATE) {
+                db.users_1 = db.users_1.filter(u => u !== senderId);
+            }
+            saveDb();
+            return;
+        }
+
+        let isGroup1Task = (db.today.msgId_1 === targetMsgId);
+        let isLateTask = false;
+        let lateDate = null;
+
+        if (!isGroup1Task) {
+            if (db.pastMsgIds_1 && db.pastMsgIds_1[targetMsgId]) {
+                isLateTask = true;
+                lateDate = db.pastMsgIds_1[targetMsgId];
+            } else {
+                return;
+            }
+        }
+
+        const inGroup1 = db.users_1.includes(senderId);
+
+        if (emoji) {
+            if (!VALID_REACTIONS.includes(emoji)) return;
+            if (isLateTask) {
+                if (!inGroup1) return;
+                if (db.history_1[lateDate] && db.history_1[lateDate].includes(senderId)) return;
+                if (!db.late_1[lateDate]) db.late_1[lateDate] = [];
+                if (!db.late_1[lateDate].includes(senderId)) {
+                    db.late_1[lateDate].push(senderId);
+                    if (db.strikes && db.strikes[senderId] && db.strikes[senderId] > 0) {
+                        db.strikes[senderId]--;
+                    }
+                    console.log(`🟧 Кешігіп оқыды: ${senderId} -> ${lateDate}`);
+                }
+            } else if (isGroup1Task) {
+                if (!inGroup1) return;
+                if (!db.today.read_1.includes(senderId)) {
+                    db.today.read_1.push(senderId);
+                    console.log(`✅ Оқыды деп белгіленді: ${senderId}`);
+                }
+            }
+        } else {
+            if (isLateTask) {
+                if (db.late_1[lateDate]) {
+                    const idx = db.late_1[lateDate].indexOf(senderId);
+                    if (idx > -1) db.late_1[lateDate].splice(idx, 1);
+                }
+            } else {
+                const idx = db.today.read_1.indexOf(senderId);
+                if (idx > -1) db.today.read_1.splice(idx, 1);
+            }
+        }
+        saveDb();
+
+        if (emoji && !isLateTask) {
+            const validUsers1 = db.users_1.filter(u => u);
+            if (validUsers1.length > 0) {
+                const allRead1 = validUsers1.every(u => db.today.read_1.includes(u));
+                if (allRead1) {
+                    try {
+                        const dateStr = db.today.date || getAlmatyDateStr();
+                        db.history_1[dateStr] = [...db.today.read_1];
+
+                        await sock.sendMessage(GROUP_ID, {
+                            text: `✅ *МашаАллаһ!*\nБүгін барлық қатысушылар тапсырманы ерте аяқтады!\nДедлайн жабылды. Алла разы болсын! 🤲`
+                        });
+
+                        const count = getWorkingDaysCount(dateStr);
+                        const juz1 = getJuz1(count);
+
+                        if (juz1 === 30) await sendKhatmStats('GROUP_1', dateStr);
+
+                        const dObj = new Date(dateStr + 'T00:00:00');
+                        if (dObj.getDay() === 6) {
+                            await sendWeeklyStats(GROUP_ID, dateStr);
+                        }
+
+                        if (db.today.msgId_1) {
+                            if (!db.pastMsgIds_1) db.pastMsgIds_1 = {};
+                            db.pastMsgIds_1[db.today.msgId_1] = dateStr;
+                        }
+                        db.today.msgId_1 = null;
+                        saveDb();
+                        console.log("Барлығы оқып бітті. Дедлайн ерте жабылды!");
+                    } catch (e) {
+                        console.error("Ерте дедлайн жабуда қате шықты:", e);
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        console.error("Реакцияны өңдеуде қате:", e);
+    }
+}
+
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     const { version, isLatest } = await fetchLatestBaileysVersion();
@@ -556,6 +666,27 @@ async function connectToWhatsApp() {
         }
     });
 
+    // Baileys реакцияларды осы оқиға арқылы жібереді
+    sock.ev.on('messages.reaction', async (reactions) => {
+        for (const reaction of reactions) {
+            try {
+                const targetMsgId = reaction.key.id;
+                const emoji = reaction.reaction?.text || '';
+                // reaction.key.participant — реакция қойылған хабарлама авторы
+                // reaction.reaction.key.participant — реакцияны қойған адам (біздің клиент)
+                let reactorJid = reaction.reaction?.key?.participant || reaction.reaction?.key?.remoteJid;
+                if (!reactorJid) {
+                    console.log('⚠️ messages.reaction: reactorJid анықталмады, өткізіп жіберу');
+                    continue;
+                }
+                const senderId = cleanUserId(reactorJid);
+                await handleReaction(senderId, targetMsgId, emoji || null);
+            } catch (e) {
+                console.error('messages.reaction өңдеуде қате:', e);
+            }
+        }
+    });
+
     sock.ev.on('messages.upsert', async (m) => {
         if (m.type !== 'notify') return;
 
@@ -572,109 +703,14 @@ async function connectToWhatsApp() {
             if (actualMessage?.viewOnceMessageV2) actualMessage = actualMessage.viewOnceMessageV2.message;
 
             if (actualMessage?.reactionMessage) {
-                msg.message = actualMessage;
-                const reaction = msg.message.reactionMessage;
+                const reaction = actualMessage.reactionMessage;
                 const targetMsgId = reaction.key.id;
                 const emoji = reaction.text;
-
-                const validReactions = ['👍', '👍🏻', '👍🏼', '👍🏽', '👍🏾', '👍🏿', '❤', '❤️', '✅', '➕'];
-
-                if (targetMsgId === db.regMsgId_1) {
-                    if (emoji && validReactions.includes(emoji)) {
-                        if (getAlmatyDateStr() === START_DATE) {
-                            if (!db.users_1.includes(senderId)) {
-                                db.users_1.push(senderId);
-                                console.log(`Тіркелді (1-пара): ${senderId}`);
-                            }
-                        }
-                    } else if (!emoji && getAlmatyDateStr() === START_DATE) {
-                        db.users_1 = db.users_1.filter(u => u !== senderId);
-                    }
-                    saveDb();
-                    return;
-                }
-
-                let isGroup1Task = (db.today.msgId_1 === targetMsgId);
-                let isLateTask = false;
-                let lateDate = null;
-
-                if (!isGroup1Task) {
-                    if (db.pastMsgIds_1 && db.pastMsgIds_1[targetMsgId]) {
-                        isLateTask = true;
-                        lateDate = db.pastMsgIds_1[targetMsgId];
-                    } else {
-                        return;
-                    }
-                }
-
-                const inGroup1 = db.users_1.includes(senderId);
-
-                if (emoji) {
-                    if (!validReactions.includes(emoji)) return;
-                    if (isLateTask) {
-                        if (!inGroup1) return;
-                        if (db.history_1[lateDate] && db.history_1[lateDate].includes(senderId)) return;
-                        if (!db.late_1[lateDate]) db.late_1[lateDate] = [];
-                        if (!db.late_1[lateDate].includes(senderId)) {
-                            db.late_1[lateDate].push(senderId);
-                            if (db.strikes && db.strikes[senderId] && db.strikes[senderId] > 0) {
-                                db.strikes[senderId]--;
-                            }
-                            console.log(`🟧 Кешігіп оқыды: ${senderId} -> ${lateDate}`);
-                        }
-                    } else if (isGroup1Task) {
-                        if (!inGroup1) return;
-                        if (!db.today.read_1.includes(senderId)) db.today.read_1.push(senderId);
-                    }
-                } else {
-                    if (isLateTask) {
-                        if (db.late_1[lateDate]) {
-                            const idx = db.late_1[lateDate].indexOf(senderId);
-                            if (idx > -1) db.late_1[lateDate].splice(idx, 1);
-                        }
-                    } else {
-                        const idx = db.today.read_1.indexOf(senderId);
-                        if (idx > -1) db.today.read_1.splice(idx, 1);
-                    }
-                }
-                saveDb();
-
-                if (emoji && !isLateTask) {
-                    const validUsers1 = db.users_1.filter(u => u);
-                    if (validUsers1.length > 0) {
-                        const allRead1 = validUsers1.every(u => db.today.read_1.includes(u));
-                        if (allRead1) {
-                            try {
-                                const dateStr = db.today.date || getAlmatyDateStr();
-                                db.history_1[dateStr] = [...db.today.read_1];
-
-                                await sock.sendMessage(GROUP_ID, {
-                                    text: `✅ *МашаАллаһ!*\nБүгін барлық қатысушылар тапсырманы ерте аяқтады!\nДедлайн жабылды. Алла разы болсын! 🤲`
-                                });
-
-                                const count = getWorkingDaysCount(dateStr);
-                                const juz1 = getJuz1(count);
-
-                                if (juz1 === 30) await sendKhatmStats('GROUP_1', dateStr);
-
-                                const dObj = new Date(dateStr + 'T00:00:00');
-                                if (dObj.getDay() === 6) {
-                                    await sendWeeklyStats(GROUP_ID, dateStr);
-                                }
-
-                                if (db.today.msgId_1) {
-                                    if (!db.pastMsgIds_1) db.pastMsgIds_1 = {};
-                                    db.pastMsgIds_1[db.today.msgId_1] = dateStr;
-                                }
-                                db.today.msgId_1 = null;
-                                saveDb();
-                                console.log("Барлығы оқып бітті. Дедлайн ерте жабылды!");
-                            } catch (e) {
-                                console.error("Ерте дедлайн жабуда қате шықты:", e);
-                            }
-                        }
-                    }
-                }
+                // messages.upsert арқылы келген реакция — senderId-ді msg.key.participant-тен аламыз
+                const reactorJid = msg.key.participant || msg.key.remoteJid;
+                const reactSenderId = cleanUserId(reactorJid);
+                console.log(`🔔 Реакция (upsert): reactor=${reactSenderId}, target=${targetMsgId}, emoji=${emoji || '(removed)'}`);
+                await handleReaction(reactSenderId, targetMsgId, emoji || null);
                 return;
             }
 
