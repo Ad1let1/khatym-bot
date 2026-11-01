@@ -36,7 +36,11 @@ process.on('uncaughtException', (err) => {
     setTimeout(() => process.exit(1), 3000);
 });
 
-const GROUP_ID = process.env.GROUP_ID || 'YOUR_GROUP_ID@g.us';
+const GROUP_ID = process.env.GROUP_ID;
+if (!GROUP_ID) {
+    console.error('❌ GROUP_ID .env файлында көрсетілмеген!');
+    process.exit(1);
+}
 const TIMEZONE = 'Asia/Almaty';
 const START_DATE = '2026-02-16';
 const START_JUZ_1 = 21;
@@ -81,8 +85,12 @@ let db = {
         msgId_5: null,
         read_1: [],
         read_5: []
-    }
+    },
+    lid_map: {},
+    lastDm: {}
 };
+
+const RAMADAN_DATE = '2027-02-07';
 
 if (fs.existsSync(STATS_FILE)) {
     try {
@@ -96,6 +104,8 @@ if (fs.existsSync(STATS_FILE)) {
         if (!db.pastMsgIds_1) db.pastMsgIds_1 = {};
         if (!db.hasOwnProperty('regMsgId_1')) db.regMsgId_1 = null;
         if (!db.hasOwnProperty('regMsgId_5')) db.regMsgId_5 = null;
+        if (!db.lid_map) db.lid_map = {};
+        if (!db.lastDm) db.lastDm = {};
     } catch (err) {
         console.error("Файлды оқуда қате шықты, жаңасын құрудамыз.", err);
     }
@@ -124,6 +134,146 @@ async function safeSendWithMentions(targetJid, text, mentionUserIds) {
 let simulatedDate = null;
 function cleanUserId(userId) {
     return fromBaileysJid(userId);
+}
+
+/**
+ * ──────────────────────────────────────────────────────────
+ * LID (Linked Device ID) → Реальный номер телефона маппинг.
+ * ──────────────────────────────────────────────────────────
+ * Когда пользователь ставит реакцию с WhatsApp Web / ПК,
+ * Baileys может вернуть скрытый 15-значный LID вместо номера.
+ * Эта функция резолвит LID через groupMetadata.
+ */
+
+// Кэш: lid -> { realJid, timestamp }
+const lidCache = new Map();
+const LID_CACHE_TTL = 5 * 60 * 1000; // 5 минут
+
+/**
+ * Определяет, является ли JID скрытым LID.
+ * LID — это числовой ID длиной ≥15 цифр (обычно ровно 15),
+ * может приходить как "123456789012345@lid", "123456789012345@s.whatsapp.net",
+ * или просто числовая строка без суффикса.
+ */
+function isLidJid(jid) {
+    if (!jid) return false;
+    // Явный суффикс @lid
+    if (jid.includes('@lid')) return true;
+    // Извлекаем числовую часть (до @ и до :)
+    const numPart = jid.split('@')[0].split(':')[0];
+    // LID: ≥15 цифр, обычные номера: 10-13 цифр
+    return /^\d{15,}$/.test(numPart);
+}
+
+/**
+ * Резолвит rawJid в реальный номер телефона.
+ * Использует встроенный Baileys API (signalRepository.lidMapping)
+ * для чтения маппингов LID ↔ PN из локальных файлов auth_info_baileys/.
+ *
+ * @param {string} rawJid — входящий JID (может быть LID или обычный)
+ * @param {string} groupId — ID группы (используется как fallback)
+ * @returns {Promise<string>} — реальный JID или исходный, если не удалось резолвить
+ */
+async function resolveRealJid(rawJid, groupId) {
+    if (!rawJid || !isLidJid(rawJid)) return rawJid;
+
+    const lidNum = rawJid.split('@')[0].split(':')[0];
+
+    // 1. Проверяем ручной маппинг (db.lid_map)
+    if (db.lid_map && db.lid_map[lidNum]) {
+        console.log(`🔗 LID табылды (db.lid_map): ${lidNum} -> ${db.lid_map[lidNum]}`);
+        return db.lid_map[lidNum];
+    }
+
+    // 2. Проверяем временный кэш
+    const cached = lidCache.get(lidNum);
+    if (cached && (Date.now() - cached.timestamp < LID_CACHE_TTL)) {
+        console.log(`🔗 LID кэштен табылды: ${lidNum} → ${cached.realJid}`);
+        return cached.realJid;
+    }
+
+    // 3. Baileys встроенный API: getPNForLID (auth_info_baileys/ файлдарынан оқиды)
+    try {
+        const lidJid = `${lidNum}@lid`;
+        console.log(`🔍 LID резолвинг: ${rawJid} — Baileys lidMapping API арқылы...`);
+        const pnJid = await sock.signalRepository.lidMapping.getPNForLID(lidJid);
+        if (pnJid) {
+            console.log(`✅ LID резолвинг сәтті (Baileys API): ${rawJid} → ${pnJid}`);
+            lidCache.set(lidNum, { realJid: pnJid, timestamp: Date.now() });
+            return pnJid;
+        }
+        console.log(`⚠️ Baileys lidMapping API: ${lidJid} үшін маппинг табылмады.`);
+    } catch (err) {
+        console.error(`❌ Baileys lidMapping API қатесі (${rawJid}):`, err.message);
+    }
+
+    // 4. Fallback: groupMetadata (ескі әдіс, таймаутпен)
+    try {
+        console.log(`🔍 LID резолвинг fallback: ${rawJid} — groupMetadata сұрау жіберілуде...`);
+        const metadata = await Promise.race([
+            sock.groupMetadata(groupId),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout groupMetadata")), 5000))
+        ]);
+
+        for (const participant of metadata.participants) {
+            const pLid = participant.lid;
+            if (pLid) {
+                const pLidNum = pLid.split('@')[0].split(':')[0];
+                if (pLidNum === lidNum) {
+                    const realJid = participant.id;
+                    console.log(`✅ LID резолвинг сәтті (groupMetadata): ${rawJid} → ${realJid}`);
+                    lidCache.set(lidNum, { realJid, timestamp: Date.now() });
+                    return realJid;
+                }
+            }
+        }
+        console.log(`⚠️ LID ${lidNum} groupMetadata-дан да табылмады.`);
+    } catch (err) {
+        console.error(`❌ groupMetadata fallback қатесі (${rawJid}):`, err.message);
+    }
+
+    console.log(`⚠️ LID ${lidNum} ешбір әдіспен резолвингті мүмкін болмады. Исходный LID қайтарылады.`);
+    return rawJid;
+}
+
+/**
+ * Нормализует ID пользователя до чистого номера (без суффиксов).
+ * Используется для «мягкого» сравнения ID из Baileys (@s.whatsapp.net)
+ * с ID из базы (@c.us) — сравниваем только цифры.
+ */
+function normalizeId(id) {
+    if (!id) return '';
+    // Убираем device suffix (77001234567:123@s.whatsapp.net -> 77001234567)
+    return id.split('@')[0].split(':')[0];
+}
+
+/**
+ * Проверяет, содержится ли userId в массиве userList,
+ * сравнивая только числовую часть ID (без @c.us / @s.whatsapp.net).
+ */
+function includesUser(userList, userId) {
+    const normalizedTarget = normalizeId(userId);
+    return userList.some(u => normalizeId(u) === normalizedTarget);
+}
+
+/**
+ * Находит и возвращает ID из массива, совпадающий по числовой части.
+ * Нужно чтобы push/splice работали с тем же форматом, что в массиве.
+ */
+function findMatchingId(userList, userId) {
+    const normalizedTarget = normalizeId(userId);
+    return userList.find(u => normalizeId(u) === normalizedTarget);
+}
+
+/**
+ * Очищает эмодзи от модификаторов цвета кожи (Fitzpatrick scale)
+ * и variation selectors, оставляя базовый символ.
+ * 👍🏽 -> 👍, ❤️ -> ❤
+ */
+function stripEmojiModifiers(emoji) {
+    if (!emoji) return emoji;
+    // Remove skin tone modifiers (U+1F3FB..U+1F3FF) and variation selectors (U+FE0E, U+FE0F)
+    return emoji.replace(/[\u{1F3FB}-\u{1F3FF}\uFE0E\uFE0F]/gu, '');
 }
 
 function getAlmatyDateStr() {
@@ -252,6 +402,33 @@ async function sendMorningTask(dateStr) {
 
         if (juz1 === 30) await sock.sendMessage(GROUP_ID, { text: "🎉 Бүгін Хатымның соңғы күні! Жігерленіп, аяқтап тастайық!" });
 
+        // ── Milestone celebrations ──
+        // Хатымның жартысы (экватор)
+        if (juz1 === 15) {
+            await sock.sendMessage(GROUP_ID, {
+                text: `🌗 *Жарты жолдан өттік!*\n` +
+                    `15/30 пара оқылды! Жартысы артта қалды!\n` +
+                    `Қалған 15 параны да бірге аяқтайық, ИншаАллаһ! 💪🤲`
+            });
+        }
+        // Дөңгелек оқу күндері (50, 100, 150, 200...)
+        if (count > 0 && count % 50 === 0) {
+            await sock.sendMessage(GROUP_ID, {
+                text: `🎉 *МЕРЕЙТОЙ!*\n` +
+                    `Бүгін біздің *${count}-ші* оқу күніміз!\n` +
+                    `Алла Тағала барлық оқыған Құранымызды қабыл етсін! 🤲\n` +
+                    `Алға, тоқтамай жалғастырамыз! 🚀`
+            });
+        }
+        // Хатм номерін атап өту (5, 10, 15...)
+        if (juz1 === 1 && db.khatymCount_1 > 1 && (db.khatymCount_1 - 1) % 5 === 0) {
+            await sock.sendMessage(GROUP_ID, {
+                text: `🏆 *СубханАллаһ!*\n` +
+                    `Бұл біздің *${db.khatymCount_1}-ші ХАТЫМЫМЫЗ* басталды!\n` +
+                    `Алла барлық оқығанымызды қабыл етсін! 🤲`
+            });
+        }
+
     } catch (e) {
         console.error("Тапсырма жіберуде қате шықты:", e);
     }
@@ -262,7 +439,7 @@ async function sendWarning(hour, isSatSpecial = false) {
 
     try {
         const validUsers1 = db.users_1.filter(u => u);
-        const debtors1 = validUsers1.filter(u => !db.today.read_1.includes(u));
+        const debtors1 = validUsers1.filter(u => !includesUser(db.today.read_1, u));
         const totalUsers = validUsers1.length;
 
         if (totalUsers === 0) return;
@@ -295,23 +472,45 @@ async function sendWarning(hour, isSatSpecial = false) {
             return;
         }
 
+        // Хадистер мен мотивациялық сөздер ротациясы
+        const reminderQuotes = [
+            `📿 Аллаһ елшісі ﷺ : *«Кімде-кім Алланың кітабынан бір әріп оқыса, оған бір жақсылық (сауап) жазылады. Ал әрбір жақсылық он еселенеді. Мен „Әлиф, Ләм, Мимді“ бір әріп деп айтпаймын. Керісінше, „Әлиф“ — бір әріп, „Ләм“ — бір әріп, „Мим“ де — дербес бір әріп», — деген»*\n— (Имам Тирмизи)`,
+            `📿 Аллаһ елшісі ﷺ : *«Құран оқыңдар, өйткені ол Қиямет күні оқыған адамына шапағатшы болады»*\n— (Муслим)`,
+            `📿 Аллаһ елшісі ﷺ : *«Құранды шебер оқитын адам — ардақты періштелермен бірге болады»*\n— (Бухари, Муслим)`,
+            `📿 Аллаһ елшісі ﷺ : *«Аллаһтың ең жақсы көретін ісі — аз болса да тұрақты істелетін іс»*\n— (Бухари, Муслим)`,
+            `📿 Аллаһ елшісі ﷺ : *«Жүрегінде Құраны жоқ адам – қираған үй секілді»*\n— (Тирмизи)`,
+            `📿 Аллаһ елшісі ﷺ : *«Ақиқатында, жүректер Алланы еске алумен тыныштық табады»*\n— (Ар-Рағд, 13:28)`,
+            `📿 Аллаһ елшісі ﷺ : *\n«خَيْرُكُمْ مَنْ تَعَلَّمَ الْقُرْآنَ وَعَلَّمَهُ»\n«Сендердің ең жақсыларың (ең абзалдарың) — Құранды үйреніп, оны басқаларға үйреткендерің»*\n— (Бухари 5027)`
+        ];
+        const quoteIndex = Math.floor(Date.now() / 86400000) % reminderQuotes.length;
+        const todayQuote = reminderQuotes[quoteIndex];
+
+        const readCount = db.today.read_1.length;
+        const readPercent = totalUsers > 0 ? Math.round((readCount / totalUsers) * 100) : 0;
+
         let text = "";
         if (isSatSpecial) {
-            text = `⚠️ *ЕСКЕРТУ*\nСенбілік тапсырманың дедлайны **ертең (Жексенбі)** кешке дейін!\nҮлгермеген қатысушылар үшін уақыт әлі бар.\n───────────────\n\n`;
+            text = `🤲 *Кешкі еске салу*\n\n` +
+                `${todayQuote}\n\n` +
+                `📊 Бүгін: *${readCount}/${totalUsers}* оқып бітірді (${readPercent}%)\n` +
+                `───────────────\n\n` +
+                `Сенбілік параны оқуға Жексенбі кешке дейін уақыт бар!\n` +
+                `Сіздерді күтіп отырмыз:\n\n`;
         } else {
-            text = `⚠️ *ЕСКЕРТУ*\nЕсеп беру уақытының аяқталуына *${hour} сағат* қалды!\n───────────────\n\n`;
+            text = `🤲 *Кешкі еске салу*\n\n` +
+                `${todayQuote}\n\n` +
+                `📊 Бүгін: *${readCount}/${totalUsers}* оқып бітірді (${readPercent}%)\n` +
+                `───────────────\n\n` +
+                `Бүгінгі параны оқуға әлі уақыт бар!\n` +
+                `Сіздерді күтіп отырмыз:\n\n`;
         }
 
         if (debtors1.length > 0) {
             for (let uid of debtors1) {
                 text += `@${uid.split('@')[0]} `;
             }
-            text += "\n";
-            if (isSatSpecial) {
-                text += `───────────────\n🤲 Сенбілік параларыңызды асықпай Жексенбі кешке дейін оқып, реакция қоюды ұмытпаңыздар!`;
-            } else {
-                text += `───────────────\n🤲 Алла ризалығы үшін, параларыңызды оқып, таңғы хабарламаға белгі қоюды ұмытпаңыздар!`;
-            }
+            text += "\n\n";
+            text += `💡 _Тіпті аздап оқысаңыз да — сауабы зор!_`;
             await safeSendWithMentions(GROUP_ID, text, debtors1);
         }
     } catch (e) {
@@ -330,7 +529,7 @@ async function sendDeadline(dateStr) {
             `📅 Күн: ${formatDateToKazakh(taskDate)}\n` +
             `───────────────\n\n`;
 
-        const missed1 = db.users_1.filter(u => !db.today.read_1.includes(u));
+        const missed1 = db.users_1.filter(u => !includesUser(db.today.read_1, u));
 
         for (let uid of missed1) {
             if (!db.strikes) db.strikes = {};
@@ -371,6 +570,139 @@ async function sendDeadline(dateStr) {
     }
 }
 
+/**
+ * Персональные мягкие DM напоминания.
+ * Отправляется не чаще 1 раза в неделю:
+ * - участникам, пропустившим 2+ рабочих дня подряд;
+ * - ИЛИ если вместе (пропущенные дни + закрытые с опозданием долги) > 3 дней.
+ */
+async function sendPersonalReminders() {
+    try {
+        const todayStr = getAlmatyDateStr();
+        const todayDate = new Date(todayStr + 'T00:00:00');
+
+        for (let uid of db.users_1) {
+            // Проверяем: не отправляли ли DM за последние 7 дней
+            if (db.lastDm[uid]) {
+                const lastDmDate = new Date(db.lastDm[uid] + 'T00:00:00');
+                const daysSinceLastDm = Math.floor((todayDate - lastDmDate) / 86400000);
+                if (daysSinceLastDm < 7) continue;
+            }
+
+            // Проверяем последние 6 рабочих дней (рабочая неделя)
+            let consecutiveMisses = 0;
+            let countingConsecutive = true;
+            let missedDays = 0;
+            let lateDays = 0;
+
+            let checkDate = new Date(todayStr + 'T00:00:00');
+            let checkedWorkDays = 0;
+
+            while (checkedWorkDays < 6) {
+                checkDate.setDate(checkDate.getDate() - 1);
+                if (checkDate.getDay() === 0) continue; // Жексенбі демалыс
+                checkedWorkDays++;
+
+                const dStr = `${checkDate.getFullYear()}-${String(checkDate.getMonth() + 1).padStart(2, '0')}-${String(checkDate.getDate()).padStart(2, '0')}`;
+                const reads = db.history_1[dStr] || [];
+                const lateReads = db.late_1[dStr] || [];
+
+                const isReadOnTime = includesUser(reads, uid);
+                const isReadLate = includesUser(lateReads, uid);
+
+                if (isReadOnTime) {
+                    countingConsecutive = false;
+                } else if (isReadLate) {
+                    lateDays++;
+                    countingConsecutive = false;
+                } else {
+                    missedDays++;
+                    if (countingConsecutive) {
+                        consecutiveMisses++;
+                    }
+                }
+            }
+
+            const totalIssueDays = missedDays + lateDays;
+
+            // Шарт:
+            // 1) Қатарынан 2+ күн оқымаған
+            // 2) НЕМЕСЕ оқылмаған күндер мен кешігіп жабылған қарыздар бірге 3 күннен көп болса (> 3)
+            const shouldSend = (totalIssueDays > 3);
+
+            if (shouldSend) {
+                const userJid = toBaileysJid(uid);
+                try {
+                    const messageText = `🤲 *Ассаламу алейкум!*\n\n` +
+                        `💎 *Аллаһ сізге бір күнде 1440 алтын берді — соның 40-ын Оған қайта бере аласыз ба?*\n\n` +
+                        `Бір пара оқу — бар болғаны *40 минут*.\n` +
+                        `Ал оның сауабы — шексіз! 🤲\n\n` +
+                        `💡 Қайтып оқысаңыз — қарызды ескі тапсырмаға *+* жауап жазып жаба аласыз.\n`;
+
+                    await sock.sendMessage(userJid, { text: messageText });
+                    db.lastDm[uid] = todayStr;
+                    saveDb();
+                    console.log(`📩 Персональды DM жіберілді: ${uid} (consecutiveMisses=${consecutiveMisses}, missedDays=${missedDays}, lateDays=${lateDays}, totalIssueDays=${totalIssueDays})`);
+                } catch (dmErr) {
+                    console.error(`❌ DM жіберу қатесі (${uid}):`, dmErr.message);
+                }
+            }
+        }
+    } catch (e) {
+        console.error('Персональды еске салу қатесі:', e);
+    }
+}
+
+/**
+ * Рамазанға кері санақ.
+ * Белгілі threshold-тарда (180, 150, 120, 90, 60, 45, 30, 21, 14, 7, 3, 2, 1)
+ * топқа мотивациялық хабарлама жібереді.
+ */
+async function checkRamadanCountdown() {
+    try {
+        const todayStr = getAlmatyDateStr();
+        const today = new Date(todayStr + 'T00:00:00');
+        const ramadan = new Date(RAMADAN_DATE + 'T00:00:00');
+        const daysLeft = Math.ceil((ramadan - today) / 86400000);
+
+        if (daysLeft <= 0) return;
+
+        const thresholds = [120, 90, 60, 45, 30, 21, 14];
+        if (!thresholds.includes(daysLeft)) return;
+
+        let emoji, urgency;
+        if (daysLeft <= 45) {
+            emoji = '🌙';
+            urgency = 'Рамазанға дайындалу уақыты жақындады!';
+        } else {
+            emoji = '📅';
+            urgency = 'Құран оқуды тоқтатпайық!';
+        }
+
+        const months = Math.floor(daysLeft / 30);
+        const remainDays = daysLeft % 30;
+        let timeText;
+        if (months > 0 && remainDays > 0) {
+            timeText = `*${months} ай ${remainDays} күн*`;
+        } else if (months > 0) {
+            timeText = `*${months} ай*`;
+        } else {
+            timeText = `*${daysLeft} күн*`;
+        }
+
+        await sock.sendMessage(GROUP_ID, {
+            text: `${emoji} *РАМАЗАНҒА КЕРІ САНАҚ*\n` +
+                `───────────────\n\n` +
+                `Рамазанға ${timeText} қалды!\n\n` +
+                `${urgency}\n\n` +
+                `📖 Құранды үзбей оқып, Рамазанға дайын жүрекпен кірейік!`
+        });
+        console.log(`🌙 Рамазан кері санағы: ${daysLeft} күн қалды`);
+    } catch (e) {
+        console.error('Рамазан кері санақ қатесі:', e);
+    }
+}
+
 async function sendWeeklyStats(targetJid, dateStr) {
     const weekDates = getWeekDates(dateStr);
     let text = `📊 *АПТАЛЫҚ ЕСЕП*\n` +
@@ -392,8 +724,8 @@ async function sendWeeklyStats(targetJid, dateStr) {
 
             for (let d of weekDates) {
                 let reads = (d === db.today.date) ? db.today.read_1 : (db.history_1[d] || []);
-                if (reads.includes(uid)) { marks += "✅"; presentCount++; }
-                else if (db.late_1[d] && db.late_1[d].includes(uid)) { marks += "🟧"; lateCount++; }
+                if (includesUser(reads, uid)) { marks += "✅"; presentCount++; }
+                else if (db.late_1[d] && includesUser(db.late_1[d], uid)) { marks += "🟧"; lateCount++; }
                 else { marks += "❌"; }
             }
             const lateLabel = lateCount > 0 ? `+${lateCount}⏳` : '';
@@ -455,8 +787,8 @@ async function sendKhatmStats(groupType, dateStr) {
 
         for (let d of khatymDates) {
             let reads = historyObj[d] || [];
-            if (reads.includes(uid)) presentCount++;
-            else if (db.late_1[d] && db.late_1[d].includes(uid)) lateCount++;
+            if (includesUser(reads, uid)) presentCount++;
+            else if (db.late_1[d] && includesUser(db.late_1[d], uid)) lateCount++;
         }
 
         const missedDays = actualDays - presentCount - lateCount;
@@ -513,116 +845,207 @@ function scheduleTasks() {
     cron.schedule('0 21 * * 6', () => sendWarning(0, true), { timezone: TIMEZONE });
     cron.schedule('0 21 * * 0', () => sendWarning(3), { timezone: TIMEZONE });
     cron.schedule('59 23 * * 0', () => sendDeadline(getAlmatyDateStr()), { timezone: TIMEZONE });
+
+    // Персональды DM — күн сайын 22:00-де тексеру (аптасына 1 рет жібереді)
+    cron.schedule('0 22 * * 1-6', () => sendPersonalReminders(), { timezone: TIMEZONE });
+
+    // Рамазанға кері санақ — күн сайын таңғы 06:05-те тексеру
+    cron.schedule('5 6 * * 1-6', () => checkRamadanCountdown(), { timezone: TIMEZONE });
 }
 
 
-const VALID_REACTIONS = ['👍', '👍🏻', '👍🏼', '👍🏽', '👍🏾', '👍🏿', '❤', '❤️', '✅', '➕'];
+// Базовые эмодзи без модификаторов — проверяем через stripEmojiModifiers
+const VALID_REACTIONS_BASE = ['👍', '❤', '✅', '➕'];
+
+/**
+ * Проверяет, является ли эмодзи допустимой реакцией.
+ * Очищает от skin tone модификаторов и variation selectors.
+ */
+function isValidReaction(emoji) {
+    if (!emoji) return false;
+    const stripped = stripEmojiModifiers(emoji);
+    return VALID_REACTIONS_BASE.includes(stripped);
+}
+
+/**
+ * Ищет targetMsgId в pastMsgIds_1, учитывая что старые записи могут
+ * храниться в формате полного Baileys ключа (true_groupId_msgId_senderJid).
+ */
+function findPastMsgDate(targetMsgId) {
+    if (!db.pastMsgIds_1) return null;
+    // 1. Прямое совпадение (новый формат — короткий ID)
+    if (db.pastMsgIds_1[targetMsgId]) {
+        return db.pastMsgIds_1[targetMsgId];
+    }
+    // 2. Поиск в старых ключах формата "true_groupJid_MSGID_senderJid"
+    for (const fullKey of Object.keys(db.pastMsgIds_1)) {
+        if (fullKey.includes('_')) {
+            const parts = fullKey.split('_');
+            // parts: ["true", groupJid, msgId, senderJid]
+            if (parts.length >= 3 && parts[2] === targetMsgId) {
+                return db.pastMsgIds_1[fullKey];
+            }
+        }
+    }
+    return null;
+}
 
 async function handleReaction(senderId, targetMsgId, emoji) {
     try {
-        console.log(`🔔 Реакция: sender=${senderId}, target=${targetMsgId}, emoji=${emoji || '(removed)'}`);
+        console.log(`\n=== 🛠 DEBUG: handleReaction ===`);
+        console.log(`1. senderId: ${senderId}`);
+        console.log(`2. targetMsgId: ${targetMsgId}`);
+        console.log(`3. emoji (raw): ${emoji}`);
+        console.log(`4. expected msgId_1: ${db.today.msgId_1}`);
+        console.log(`5. isGroup1Task: ${db.today.msgId_1 === targetMsgId}`);
+        console.log(`6. isInUsers1: ${includesUser(db.users_1, senderId)}`);
+        console.log(`================================\n`);
 
+        // ═══════════════════════════════════════════════════════
+        // 🔍 DEBUG: Детальная информация о реакции
+        // ═══════════════════════════════════════════════════════
+        const inGroup1 = includesUser(db.users_1, senderId);
+        const strippedEmoji = emoji ? stripEmojiModifiers(emoji) : null;
+        console.log(`\n${'═'.repeat(55)}`);
+        console.log(`🔔 РЕАКЦИЯ КЕЛДІ`);
+        console.log(`${'─'.repeat(55)}`);
+        console.log(`  📨 Хабарлама ID (target):  ${targetMsgId}`);
+        console.log(`  📋 Күтілетін msgId_1:      ${db.today.msgId_1}`);
+        console.log(`  🆔 Кім қойды (senderId):   ${senderId}`);
+        console.log(`  🔢 Нормализованный ID:     ${normalizeId(senderId)}`);
+        console.log(`  👥 users_1 ішінде бар ма:  ${inGroup1}`);
+        console.log(`  😀 Эмодзи (raw):           ${emoji ? `"${emoji}" (codepoints: ${[...emoji].map(c => 'U+' + c.codePointAt(0).toString(16).toUpperCase()).join(' ')})` : '(жойылды)'}`);
+        console.log(`  😀 Эмодзи (stripped):      ${strippedEmoji ? `"${strippedEmoji}"` : '(жойылды)'}`);
+        console.log(`  ✅ Жарамды реакция ма:     ${isValidReaction(emoji)}`);
+        console.log(`  📊 read_1 саны:            ${db.today.read_1.length}/${db.users_1.length}`);
+        console.log(`${'═'.repeat(55)}\n`);
+        // ═══════════════════════════════════════════════════════
+
+        // --- Тіркелу хабарламасына реакция ---
         if (targetMsgId === db.regMsgId_1) {
-            if (emoji && VALID_REACTIONS.includes(emoji)) {
+            if (emoji && isValidReaction(emoji)) {
                 if (getAlmatyDateStr() === START_DATE) {
-                    if (!db.users_1.includes(senderId)) {
+                    if (!includesUser(db.users_1, senderId)) {
                         db.users_1.push(senderId);
                         console.log(`Тіркелді (1-пара): ${senderId}`);
                     }
                 }
             } else if (!emoji && getAlmatyDateStr() === START_DATE) {
-                db.users_1 = db.users_1.filter(u => u !== senderId);
+                const matchId = findMatchingId(db.users_1, senderId);
+                if (matchId) db.users_1 = db.users_1.filter(u => u !== matchId);
             }
             saveDb();
             return;
         }
 
+        // --- Бүгінгі тапсырмаға реакция ма? ---
         let isGroup1Task = (db.today.msgId_1 === targetMsgId);
         let isLateTask = false;
         let lateDate = null;
 
         if (!isGroup1Task) {
-            if (db.pastMsgIds_1 && db.pastMsgIds_1[targetMsgId]) {
+            // pastMsgIds_1 ішінен іздеу (ескі толық кілтпен де, жаңа қысқа ID-мен де)
+            lateDate = findPastMsgDate(targetMsgId);
+            if (lateDate) {
                 isLateTask = true;
-                lateDate = db.pastMsgIds_1[targetMsgId];
+                console.log(`📌 pastMsgIds_1-ден табылды: targetMsgId=${targetMsgId} -> ${lateDate}`);
             } else {
+                console.log(`⏭️ targetMsgId=${targetMsgId} — бұл бізге қатысты емес хабарлама, өткіземіз.`);
                 return;
             }
         }
 
-        const inGroup1 = db.users_1.includes(senderId);
-
         if (emoji) {
-            if (!VALID_REACTIONS.includes(emoji)) return;
+            if (!isValidReaction(emoji)) {
+                console.log(`⏭️ Жарамсыз реакция: "${emoji}" (stripped: "${strippedEmoji}"), өткіземіз.`);
+                return;
+            }
             if (isLateTask) {
-                if (!inGroup1) return;
-                if (db.history_1[lateDate] && db.history_1[lateDate].includes(senderId)) return;
+                if (!inGroup1) { console.log(`⏭️ ${senderId} users_1 тобында жоқ, өткіземіз.`); return; }
+                if (db.history_1[lateDate] && includesUser(db.history_1[lateDate], senderId)) return;
                 if (!db.late_1[lateDate]) db.late_1[lateDate] = [];
-                if (!db.late_1[lateDate].includes(senderId)) {
+                if (!includesUser(db.late_1[lateDate], senderId)) {
                     db.late_1[lateDate].push(senderId);
-                    if (db.strikes && db.strikes[senderId] && db.strikes[senderId] > 0) {
-                        db.strikes[senderId]--;
+                    if (db.strikes) {
+                        const strikeId = findMatchingId(Object.keys(db.strikes), senderId);
+                        if (strikeId && db.strikes[strikeId] > 0) db.strikes[strikeId]--;
                     }
                     console.log(`🟧 Кешігіп оқыды: ${senderId} -> ${lateDate}`);
                 }
             } else if (isGroup1Task) {
-                if (!inGroup1) return;
-                if (!db.today.read_1.includes(senderId)) {
+                if (!inGroup1) { console.log(`⏭️ ${senderId} users_1 тобында жоқ, өткіземіз.`); return; }
+                if (!includesUser(db.today.read_1, senderId)) {
                     db.today.read_1.push(senderId);
-                    console.log(`✅ Оқыды деп белгіленді: ${senderId}`);
+                    console.log(`✅ Оқыды деп белгіленді: ${senderId} (read_1: ${db.today.read_1.length}/${db.users_1.length})`);
                 }
             }
         } else {
+            // Реакция жойылды
             if (isLateTask) {
                 if (db.late_1[lateDate]) {
-                    const idx = db.late_1[lateDate].indexOf(senderId);
-                    if (idx > -1) db.late_1[lateDate].splice(idx, 1);
+                    const matchId = findMatchingId(db.late_1[lateDate], senderId);
+                    if (matchId) {
+                        const idx = db.late_1[lateDate].indexOf(matchId);
+                        if (idx > -1) db.late_1[lateDate].splice(idx, 1);
+                    }
                 }
             } else {
-                const idx = db.today.read_1.indexOf(senderId);
-                if (idx > -1) db.today.read_1.splice(idx, 1);
+                const matchId = findMatchingId(db.today.read_1, senderId);
+                if (matchId) {
+                    const idx = db.today.read_1.indexOf(matchId);
+                    if (idx > -1) db.today.read_1.splice(idx, 1);
+                }
             }
         }
         saveDb();
 
+        // --- Барлығы оқып бітті ме? Ерте дедлайн жабу ---
         if (emoji && !isLateTask) {
-            const validUsers1 = db.users_1.filter(u => u);
-            if (validUsers1.length > 0) {
-                const allRead1 = validUsers1.every(u => db.today.read_1.includes(u));
-                if (allRead1) {
-                    try {
-                        const dateStr = db.today.date || getAlmatyDateStr();
-                        db.history_1[dateStr] = [...db.today.read_1];
-
-                        await sock.sendMessage(GROUP_ID, {
-                            text: `✅ *МашаАллаһ!*\nБүгін барлық қатысушылар тапсырманы ерте аяқтады!\nДедлайн жабылды. Алла разы болсын! 🤲`
-                        });
-
-                        const count = getWorkingDaysCount(dateStr);
-                        const juz1 = getJuz1(count);
-
-                        if (juz1 === 30) await sendKhatmStats('GROUP_1', dateStr);
-
-                        const dObj = new Date(dateStr + 'T00:00:00');
-                        if (dObj.getDay() === 6) {
-                            await sendWeeklyStats(GROUP_ID, dateStr);
-                        }
-
-                        if (db.today.msgId_1) {
-                            if (!db.pastMsgIds_1) db.pastMsgIds_1 = {};
-                            db.pastMsgIds_1[db.today.msgId_1] = dateStr;
-                        }
-                        db.today.msgId_1 = null;
-                        saveDb();
-                        console.log("Барлығы оқып бітті. Дедлайн ерте жабылды!");
-                    } catch (e) {
-                        console.error("Ерте дедлайн жабуда қате шықты:", e);
-                    }
-                }
-            }
+            await checkAllReadAndCloseEarly();
         }
     } catch (e) {
         console.error("Реакцияны өңдеуде қате:", e);
+    }
+}
+
+/**
+ * Егер барлық қатысушылар ағымдағы тапсырманы оқып бітірсе — дедлайнды ерте жабады.
+ * Реакция арқылы да, "+" жауабы арқылы да белгіленгенде шақырылады.
+ */
+async function checkAllReadAndCloseEarly() {
+    if (!db.today.msgId_1) return;
+    const validUsers1 = db.users_1.filter(u => u);
+    if (validUsers1.length === 0) return;
+    const allRead1 = validUsers1.every(u => includesUser(db.today.read_1, u));
+    if (!allRead1) return;
+
+    try {
+        const dateStr = db.today.date || getAlmatyDateStr();
+        db.history_1[dateStr] = [...db.today.read_1];
+
+        await sock.sendMessage(GROUP_ID, {
+            text: `✅ *МашаАллаһ!*\nБүгін барлық қатысушылар тапсырманы ерте аяқтады!\nДедлайн жабылды. Алла разы болсын! 🤲`
+        });
+
+        const count = getWorkingDaysCount(dateStr);
+        const juz1 = getJuz1(count);
+
+        if (juz1 === 30) await sendKhatmStats('GROUP_1', dateStr);
+
+        const dObj = new Date(dateStr + 'T00:00:00');
+        if (dObj.getDay() === 6) {
+            await sendWeeklyStats(GROUP_ID, dateStr);
+        }
+
+        if (db.today.msgId_1) {
+            if (!db.pastMsgIds_1) db.pastMsgIds_1 = {};
+            db.pastMsgIds_1[db.today.msgId_1] = dateStr;
+        }
+        db.today.msgId_1 = null;
+        saveDb();
+        console.log("🎉 Барлығы оқып бітті. Дедлайн ерте жабылды!");
+    } catch (e) {
+        console.error("Ерте дедлайн жабуда қате шықты:", e);
     }
 }
 
@@ -668,18 +1091,43 @@ async function connectToWhatsApp() {
 
     // Baileys реакцияларды осы оқиға арқылы жібереді
     sock.ev.on('messages.reaction', async (reactions) => {
+        console.log('\n=============================================');
+        console.log('🔥 RAW EVENT: messages.reaction');
+        console.log(JSON.stringify(reactions, null, 2));
+        console.log('=============================================\n');
         for (const reaction of reactions) {
             try {
+                // reaction.key — бұл реакция қойылған ХАБАРЛАМА (target message)
+                // reaction.key.id — сол хабарламаның ID-сі
                 const targetMsgId = reaction.key.id;
+
+                // reaction.reaction.text — эмодзи (бос строка = реакция жойылды)
                 const emoji = reaction.reaction?.text || '';
-                // reaction.key.participant — реакция қойылған хабарлама авторы
-                // reaction.reaction.key.participant — реакцияны қойған адам (біздің клиент)
-                let reactorJid = reaction.reaction?.key?.participant || reaction.reaction?.key?.remoteJid;
+
+                // Реакцияны КІМ қойды?
+                // Baileys-те: reaction.key.participant = хабарлама авторы (group-та),
+                // ал реакцияны қойған адам бірнеше жерде болуы мүмкін:
+                //   1) reaction.reaction.key.participant (group chat)
+                //   2) reaction.reaction.key.remoteJid (private chat / fallback)
+                //   3) Кейде Baileys versions-та reaction.reaction.key.fromMe болса — sock.user.id
+                let reactorJid = reaction.reaction?.key?.participant
+                    || reaction.reaction?.key?.remoteJid;
+
+                // Егер fromMe болса — бот өзінің реакциясы
+                if (!reactorJid && reaction.reaction?.key?.fromMe) {
+                    reactorJid = sock.user?.id;
+                }
+
                 if (!reactorJid) {
-                    console.log('⚠️ messages.reaction: reactorJid анықталмады, өткізіп жіберу');
+                    console.log('⚠️ messages.reaction: reactorJid анықталмады!');
+                    console.log('  Толық reaction объектісі:', JSON.stringify(reaction, null, 2));
                     continue;
                 }
-                const senderId = cleanUserId(reactorJid);
+
+                // LID → нақты номерге резолвинг
+                const resolvedJid = await resolveRealJid(reactorJid, reaction.key.remoteJid || GROUP_ID);
+                const senderId = cleanUserId(resolvedJid);
+                console.log(`📥 messages.reaction event: reactor=${reactorJid} -> resolved=${resolvedJid} -> cleaned=${senderId}, target=${targetMsgId}`);
                 await handleReaction(senderId, targetMsgId, emoji || null);
             } catch (e) {
                 console.error('messages.reaction өңдеуде қате:', e);
@@ -695,7 +1143,13 @@ async function connectToWhatsApp() {
 
             const chatId = msg.key.remoteJid;
             const botJid = cleanUserId(sock.user.id);
-            const senderId = msg.key.fromMe ? botJid : cleanUserId(msg.key.participant || msg.key.remoteJid);
+
+            // LID резолвинг — rawSenderJid-ді нақты номерге аударамыз
+            let rawSenderJid = msg.key.participant || msg.key.remoteJid;
+            if (!msg.key.fromMe && rawSenderJid) {
+                rawSenderJid = await resolveRealJid(rawSenderJid, chatId);
+            }
+            const senderId = msg.key.fromMe ? botJid : cleanUserId(rawSenderJid);
             const msgId = msg.key.id;
 
             let actualMessage = msg.message;
@@ -706,10 +1160,22 @@ async function connectToWhatsApp() {
                 const reaction = actualMessage.reactionMessage;
                 const targetMsgId = reaction.key.id;
                 const emoji = reaction.text;
-                // messages.upsert арқылы келген реакция — senderId-ді msg.key.participant-тен аламыз
+                // messages.upsert арқылы келген реакция:
+                // msg.key.participant = реакцияны қойған адам (group chat)
+                // msg.key.remoteJid = fallback (private chat)
                 const reactorJid = msg.key.participant || msg.key.remoteJid;
-                const reactSenderId = cleanUserId(reactorJid);
-                console.log(`🔔 Реакция (upsert): reactor=${reactSenderId}, target=${targetMsgId}, emoji=${emoji || '(removed)'}`);
+
+                console.log('\n=============================================');
+                console.log('🔥 RAW EVENT: messages.upsert (reaction)');
+                console.log(`reactorJid: ${reactorJid}`);
+                console.log(`targetMsgId: ${targetMsgId}`);
+                console.log(`emoji: ${emoji}`);
+                console.log('=============================================\n');
+
+                // LID → нақты номер резолвинг
+                const resolvedReactorJid = await resolveRealJid(reactorJid, chatId);
+                const reactSenderId = cleanUserId(resolvedReactorJid);
+                console.log(`📥 Реакция (upsert): reactor=${reactorJid} -> resolved=${resolvedReactorJid} -> cleaned=${reactSenderId}, target=${targetMsgId}, emoji=${emoji || '(removed)'}`);
                 await handleReaction(reactSenderId, targetMsgId, emoji || null);
                 return;
             }
@@ -726,15 +1192,30 @@ async function connectToWhatsApp() {
                 const dateMatch = quotedText.match(/Күн: \*(\d{2})\.(\d{2})\.(\d{4})\*/);
                 if (dateMatch) {
                     const taskDate = `${dateMatch[3]}-${dateMatch[2]}-${dateMatch[1]}`;
-                    if (db.users_1.includes(senderId)) {
-                        if (db.history_1[taskDate] && db.history_1[taskDate].includes(senderId)) return;
-                        if (taskDate === db.today.date && db.today.read_1.includes(senderId)) return;
+                    if (includesUser(db.users_1, senderId)) {
+                        if (db.history_1[taskDate] && includesUser(db.history_1[taskDate], senderId)) return;
+                        if (taskDate === db.today.date && includesUser(db.today.read_1, senderId)) return;
+
+                        // Ағымдағы тапсырма (дедлайн әлі өтпеген) — уақытында оқыды деп есептейміз
+                        if (taskDate === db.today.date && db.today.msgId_1) {
+                            db.today.read_1.push(senderId);
+                            // Бұрын қате түрде кешігу ретінде жазылған болса — алып тастаймыз
+                            if (db.late_1[taskDate]) {
+                                const lateMatch = findMatchingId(db.late_1[taskDate], senderId);
+                                if (lateMatch) db.late_1[taskDate] = db.late_1[taskDate].filter(u => u !== lateMatch);
+                            }
+                            saveDb();
+                            console.log(`✅ Жауап (+) арқылы уақытында оқыды: ${senderId} -> ${taskDate} (read_1: ${db.today.read_1.length}/${db.users_1.length})`);
+                            await checkAllReadAndCloseEarly();
+                            return;
+                        }
 
                         if (!db.late_1[taskDate]) db.late_1[taskDate] = [];
-                        if (!db.late_1[taskDate].includes(senderId)) {
+                        if (!includesUser(db.late_1[taskDate], senderId)) {
                             db.late_1[taskDate].push(senderId);
-                            if (db.strikes && db.strikes[senderId] && db.strikes[senderId] > 0) {
-                                db.strikes[senderId]--;
+                            const strikeId = findMatchingId(Object.keys(db.strikes || {}), senderId);
+                            if (strikeId && db.strikes[strikeId] > 0) {
+                                db.strikes[strikeId]--;
                             }
                             saveDb();
                             console.log(`🟧 Жауап арқылы кешігіп оқыды: ${senderId} -> ${taskDate}`);
@@ -774,7 +1255,7 @@ async function connectToWhatsApp() {
                 const helpText = `🛠 *БОТ КОМАНДАЛАРЫ (АДМИН)* 🛠\n` +
                     `_Бұл командаларды кез келген чатта (Топта немесе Жеке чатта/Избранное) жазуға болады. Жауап осы чатқа келеді._\n\n` +
                     `*Тапсырмалар мен Есептер:*\n` +
-                    `▫️ *!force_task* — Таңғы тапсырманы қазір мәжбүрлі түрде негізгі топқа жіберу\n` +
+                    `▫️ *!force_task* — Таңғы тапсырманы қазір мәжбүрлі түрде негізгі топқа жіберу (жексенбіде жұмыс істемейді; ашық тапсырма болса — *!force_task confirm*)\n` +
                     `▫️ *!force_warning* — Кешкі ескертуді негізгі топқа жіберу\n` +
                     `▫️ *!force_deadline* — Дедлайнды жабу (негізгі топқа жіберіледі)\n` +
                     `▫️ *!force_weekly* — Апталық есепті *осы чатқа* жіберу\n` +
@@ -792,6 +1273,8 @@ async function connectToWhatsApp() {
                     `▫️ *!mark_read_all today* — Барлық адамды оқыды деп белгілеу\n` +
                     `▫️ *!unmark_ids today ID* — Адамнан 'оқыды' белгісін алып тастау\n` +
                     `▫️ *!forgive_past* — Барлық адамның өткен қарыздарын жабу (Бүгіннен басқа)\n\n` +
+                    `*Техникалық (LID/Веб-версия үшін):*\n` +
+                    `▫️ *!link_lid LID НӨМІР* — Жасырын LID-ді нақты нөмірге байлау (мысалы: !link_lid 19380... 7701...)\n\n` +
                     `*Уақыт машинасы (Тест үшін):*\n` +
                     `▫️ *!setdate ЖЖЖЖ-АА-КК* — Бот үшін бүгінгі күнді өзгерту (Мысалы: !setdate 2026-03-25)\n` +
                     `▫️ *!resetdate* — Нақты уақытқа қайту\n\n` +
@@ -814,9 +1297,60 @@ async function connectToWhatsApp() {
                 reply(`⏱ *Уақыт машинасы өшірілді.*\nБот нақты уақытқа оралды: *${getAlmatyDateStr()}*`);
             }
 
-            if (messageText === '!force_task') {
+            if (messageText.startsWith('!link_lid ')) {
+                const parts = messageText.split(/\s+/);
+                if (parts.length < 3) {
+                    reply("⚠️ Қате! Үлгі: !link_lid 123456789012345 77001234567");
+                    return;
+                }
+                const lidRaw = parts[1];
+                const realRaw = parts[2];
+                const lidNum = lidRaw.replace(/\D/g, '');
+                const realId = cleanUserId(realRaw);
+
+                if (!db.lid_map) db.lid_map = {};
+                db.lid_map[lidNum] = realId;
+
+                // Егер бұл LID users_1 ішінде қалып қойса, оны өшіреміз
+                const lidAsUser = lidNum + '@c.us';
+                if (db.users_1.includes(lidAsUser)) {
+                    db.users_1 = db.users_1.filter(u => u !== lidAsUser);
+                }
+                if (db.today.read_1.includes(lidAsUser)) {
+                    db.today.read_1 = db.today.read_1.filter(u => u !== lidAsUser);
+                    if (!db.today.read_1.includes(realId)) {
+                        db.today.read_1.push(realId);
+                    }
+                }
+
+                saveDb();
+                reply(`✅ LID ${lidNum} сәтті нақты нөмірге (${realId}) байланыстырылды!\nЕнді сіздің реакцияларыңыз дұрыс есептеледі.`);
+                return;
+            }
+
+            if (messageText === '!force_task' || messageText === '!force_task confirm') {
+                const forceDateStr = getAlmatyDateStr();
+                const isSunday = new Date(forceDateStr + 'T00:00:00').getDay() === 0;
+                const hasOpenTask = !!db.today.msgId_1;
+                const confirmed = messageText === '!force_task confirm';
+
+                if (isSunday) {
+                    reply(`⛔ *Бүгін жексенбі — демалыс күні!*\n` +
+                        `Жексенбіде таңғы тапсырма жіберілмейді.\n` +
+                        `Сенбілік тапсырманың дедлайны бүгін 23:59-да жабылады.`);
+                    return;
+                }
+                if (hasOpenTask && !confirmed) {
+                    reply(`⚠️ *Назар аударыңыз!*\n` +
+                        `Әлі жабылмаған тапсырма бар: *${formatDateToKazakh(db.today.date)}* ` +
+                        `(оқығандар: ${db.today.read_1.length}/${db.users_1.length}).\n\n` +
+                        `Жаңа тапсырма жіберсеңіз, ол ескі тапсырманың орнын басады ` +
+                        `және бүгінгі белгілер жоғалуы мүмкін.\n\n` +
+                        `Сенімді болсаңыз: *!force_task confirm*`);
+                    return;
+                }
                 reply('⏳ Тапсырма жіберілуде...');
-                await sendMorningTask(getAlmatyDateStr());
+                await sendMorningTask(forceDateStr);
             }
             if (messageText === '!force_warning') {
                 await sendWarning(2);
@@ -836,7 +1370,15 @@ async function connectToWhatsApp() {
                 await sendKhatmStats('GROUP_1', '2026-03-21');
             }
             if (messageText === '!status') {
-                reply(`📅 Күн: ${db.today.date}\n👥 Оқығандар: ${db.today.read_1.length}/${db.users_1.length}`);
+                const dateStr = db.today.date || getAlmatyDateStr();
+                const read = db.today.read_1;
+                const missed = db.users_1.filter(u => !includesUser(read, u));
+                let text = `📅 Күн: ${dateStr}\n👥 Оқығандар: ${read.length}/${db.users_1.length}\n───────────────\n\n`;
+                text += `✅ *Оқығандар:*\n`;
+                for (let uid of read) text += `@${uid.split('@')[0]} `;
+                text += `\n\n❌ *Оқымағандар:*\n`;
+                for (let uid of missed) text += `@${uid.split('@')[0]} `;
+                reply(text, db.users_1);
             }
             if (messageText === '!all_ids') {
                 reply("📋 *ҚАТЫСУШЫЛАРДЫҢ ID ТІЗІМІ:*\n" + db.users_1.join('\n'));
@@ -997,7 +1539,7 @@ async function connectToWhatsApp() {
             if (messageText === '!daily_stat') {
                 const dateStr = db.today.date || getAlmatyDateStr();
                 const read = db.today.read_1;
-                const missed = db.users_1.filter(u => !read.includes(u));
+                const missed = db.users_1.filter(u => !includesUser(read, u));
                 let text = `📊 *КҮНДЕЛІКТІ ЕСЕП*\n📅 ${formatDateToKazakh(dateStr)}\n───────────────\n\n`;
                 text += `✅ *Оқығандар (${read.length}):*\n`;
                 for (let uid of read) text += `@${uid.split('@')[0]} `;
